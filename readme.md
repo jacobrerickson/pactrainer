@@ -129,21 +129,34 @@ performance tier every frame:
 
     0 = ACE   1 = OK   2 = BAD   3 = FAIL
 
-To display it, copy the `artwork/pacman/` folder from this repo into your MAME
-`artworkpath` (or zip it as `pacman.zip`). Then select the "Trainer" view from
-MAME's video options.
+### Install the layout
+
+The repo ships identical layouts under `artwork/pacman/` and `artwork/puckman/`.
+MAME does not share artwork between the parent ROM and its clones automatically,
+so **install the folder that matches the ROM name you launch with**:
+
+- Launching `mame pacman -plugin pactrainer`? Copy `artwork/pacman/` into your
+  MAME `artworkpath` (either as a `pacman/` folder or zipped as `pacman.zip`).
+- Launching `mame puckman -plugin pactrainer`? Copy `artwork/puckman/` into
+  your MAME `artworkpath` (as `puckman/` or `puckman.zip`).
+- Not sure which you use, or use both? Install both folders. There's no downside.
+
+Then relaunch MAME and select the **Trainer** view: press `Tab` in the MAME
+window → Video Options → View → `Trainer`.
 
 The bundled `default.lay` uses coloured disks as placeholders so the overlay
 works with no extra downloads.
 
 ### Adding your own face artwork
 
-1. Drop your images in `artwork/pacman/` alongside `default.lay`. Suggested
-   names: `ace.png`, `ok.png`, `bad.png`, `fail.png`.
+1. Drop your images in the artwork folder that matches your ROM
+   (`artwork/pacman/` and/or `artwork/puckman/`), alongside `default.lay`.
+   Suggested names: `ace.png`, `ok.png`, `bad.png`, `fail.png`.
 2. MAME accepts **PNG** (with alpha, recommended), **JPG**, **BMP**, and **SVG**
    for artwork files.
-3. Edit `default.lay` and replace the four `<disk state="N">...</disk>` lines
-   inside the `<element name="face">` block with:
+3. Edit `default.lay` in the same folder and replace the four
+   `<disk state="N">...</disk>` lines inside the `<element name="face">` block
+   with (adjust the extension if you're not using PNG):
 
    ```xml
    <image state="0" file="ace.png"/>
@@ -152,11 +165,11 @@ works with no extra downloads.
    <image state="3" file="fail.png"/>
    ```
 
-4. Repackage as `pacman.zip` or leave as a `pacman/` folder in your MAME
-   `artworkpath`, whichever your MAME install uses.
+4. If you use both ROM names, apply the same edit to both `default.lay` files
+   (or just install the same folder as both `pacman/` and `puckman/`).
 
-Sensible source sizes are ~64x64 or 128x128 PNGs — the layout scales them into
-a 56x56 bezel slot.
+Sensible source sizes are ~64x64 or 128x128 — the layout scales them into a
+56x56 bezel slot.
 
 The plugin runs normally if the artwork is not installed; the face output just
 has no consumer.
