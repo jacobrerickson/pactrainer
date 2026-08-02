@@ -102,6 +102,115 @@ The Plugin is run by adding `-plugin pactrainer` to your MAME arguments e.g.
 Works with "pacman" and "puckman" roms only.
 
 
+## Upgrading from a previous pactrainer install
+
+Delete or overwrite the existing `pactrainer/` folder in your MAME plugins
+directory with this one. The plugin filename and the `-plugin pactrainer`
+argument are unchanged, so nothing else in your MAME setup needs to move.
+
+Migration notes:
+
+- Your saved pattern-set choice (`active.dat`) is still read from the old
+  location under the plugin directory, so your pattern preference carries over
+  automatically. New writes go to MAME's `homepath` instead — typical defaults:
+  - Windows: `%USERPROFILE%\.mame\pactrainer\`
+  - macOS/Linux: `~/.mame/pactrainer/`
+- Nothing is written under the plugin directory any more, so read-only or
+  system-managed installs (RetroPie, packaged MAME) now work.
+- The new `artwork/` and `sounds/` features are opt-in. If you don't install
+  them, the plugin behaves exactly as before except for the on-screen
+  `popmessage` cues and the breakpoint markers on repeat plays.
+
+
+## Optional: side-bezel face overlay
+
+The plugin drives a MAME output named `pactrainer_face` that reports the current
+performance tier every frame:
+
+    0 = ACE   1 = OK   2 = BAD   3 = FAIL
+
+To display it, copy the `artwork/pacman/` folder from this repo into your MAME
+`artworkpath` (or zip it as `pacman.zip`). Then select the "Trainer" view from
+MAME's video options.
+
+The bundled `default.lay` uses coloured disks as placeholders so the overlay
+works with no extra downloads.
+
+### Adding your own face artwork
+
+1. Drop your images in `artwork/pacman/` alongside `default.lay`. Suggested
+   names: `ace.png`, `ok.png`, `bad.png`, `fail.png`.
+2. MAME accepts **PNG** (with alpha, recommended), **JPG**, **BMP**, and **SVG**
+   for artwork files.
+3. Edit `default.lay` and replace the four `<disk state="N">...</disk>` lines
+   inside the `<element name="face">` block with:
+
+   ```xml
+   <image state="0" file="ace.png"/>
+   <image state="1" file="ok.png"/>
+   <image state="2" file="bad.png"/>
+   <image state="3" file="fail.png"/>
+   ```
+
+4. Repackage as `pacman.zip` or leave as a `pacman/` folder in your MAME
+   `artworkpath`, whichever your MAME install uses.
+
+Sensible source sizes are ~64x64 or 128x128 PNGs — the layout scales them into
+a 56x56 bezel slot.
+
+The plugin runs normally if the artwork is not installed; the face output just
+has no consumer.
+
+
+## Breakpoint map
+
+Each time your run drops from ACE to OK on the pattern, the plugin records the
+board coordinate. The next time you play the same pattern, coloured markers
+appear at those spots during the first few seconds of the board so you can see
+your recurring problem corners. Corners you miss repeatedly grow more opaque.
+
+Data is written to MAME's `homepath` as `pactrainer/misses_<set>_<group>.dat`
+(one row per point: `seq,y,x,count`). Nothing is written under the plugin
+directory, so read-only installs are supported. The `active.dat` file that
+remembers your selected pattern set is also written to `homepath`.
+
+
+## Cues
+
+Two things trigger cues during play:
+
+- **Tier change** — fires when your tier gets worse (rate-limited to once per
+  second).
+- **All four ghosts** — fires the first time your score jumps by 1600 within a
+  fright period, celebrating a full ghost train.
+
+Both always show a MAME `popmessage`. They will *also* play a sound file if one
+is present in the plugin's `sounds/` directory.
+
+### Adding sound files
+
+Drop **WAV** files into `pactrainer/sounds/` with these exact names:
+
+| File | Fires when |
+|---|---|
+| `fanfare.wav` | You eat all four ghosts on one energizer |
+| `tier_ok.wav` | Tier drops from ACE to OK |
+| `tier_bad.wav` | Tier drops to BAD |
+| `tier_fail.wav` | You die mid-board |
+
+Notes:
+
+- WAV is the only format guaranteed to play across Windows / macOS / Linux with
+  no extra dependencies. MAME's Lua API has no play-sound primitive, so the
+  plugin shells out to the host OS's built-in player (`powershell` on Windows,
+  `afplay` on macOS, `paplay` or `aplay` on Linux). Other formats (MP3, OGG)
+  will work only if the picked player happens to support them.
+- Keep clips short (< 1 second) so they don't overlap with each other or with
+  the game's own audio.
+- Missing files silently no-op — the `popmessage` still fires, so nothing
+  breaks.
+
+
 ## Troubleshooting
 
 #### How do I get the plugin to work with Launchbox?

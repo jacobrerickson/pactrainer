@@ -1,31 +1,31 @@
 --Pattern Trainer for Pac-Man
 --by Jon Wilson (10yard)
 --
---The Pac-Man Trainer is an aid to learning the common patterns for completing boards.  
+--The Pac-Man Trainer is an aid to learning the common patterns for completing boards.
 --You follow an on-screen path through each board.  For the pattern to hold,  you must
---stay on track and turn the corners quickly.  
+--stay on track and turn the corners quickly.
 --
---The HUD shows information which can help during gameplay.  
+--The HUD shows information which can help during gameplay.
 --On the left of the screen you will see the current level (e.g. "L. 001"),  the current
---pattern (e.g. "P. 1/3"), and the current status (e.g. S. ACE).  The status will change 
---if you start falling behind to "OK" and finally "BAD" based on the number of dropped 
---movements/frames.  It is still possible to complete the board with a "BAD" status but 
---following the path will not guarantee success and you should be more cautious.  
---If you die then the pattern will automatically fail and you will see a blinking "FAIL" 
+--pattern (e.g. "P. 1/3"), and the current status (e.g. S. ACE).  The status will change
+--if you start falling behind to "OK" and finally "BAD" based on the number of dropped
+--movements/frames.  It is still possible to complete the board with a "BAD" status but
+--following the path will not guarantee success and you should be more cautious.
+--If you die then the pattern will automatically fail and you will see a blinking "FAIL"
 --message.  You are on your own to complete the board.
 --
 --Press P2 button to toggle between the currently available pattern sets.
---    
+--
 --PACSTRATS set:
 --    Use only three patterns to clear boards 1 through 255 and get to the kill screen!
 --    Pattern 1 is used on boards 1 through 4
 --    Pattern 2 is used on boards 5 through 20
 --    Pattern 3 is used on boards 21 through 255
 --    All three patterns clear the entire board and get both prizes.
---	
+--
 --	  More information about following these patterns in the video at:
 --	  https://www.youtube.com/watch?v=wKQy8LTTzC4
---    
+--
 --KILLERCLOWN set:
 --    Uses 5 patterns but some of them are very similar so should be easier to learn.
 --    These patterns are robust until near to the end of each board.  You may need to
@@ -35,7 +35,7 @@
 --    Pattern 3 if for boards 5 through 16.
 --    Pattern 4 is for boards 17, 19 and 20.  You'll need to freestyle near the end.
 --    Pattern 5 is for boards 21 through 255
---	
+--
 --	  More information about Killerclown's patterns is to be found at
 --    https://www.mameworld.info/net/pacman/patterns.html
 --
@@ -54,7 +54,7 @@
 -----------------------------------------------------------------------------------------
 local exports = {
 	name = "pactrainer",
-	version = "0.1q",
+	version = "0.2",
 	description = "Pac-Man Pattern Trainer",
 	license = "GNU GPLv3",
 	author = { name = "Jon Wilson (10yard)" } }
@@ -66,19 +66,50 @@ function pactrainer.startplugin()
 	local SETS = {"pacstrats", "killerclown", "perfect_nrc"}
 	local LAG_PIXELS_DEFAULT = 5
 
+	-- Tier constants: 0=ACE, 1=OK, 2=BAD, 3=FAIL
+	local TIER_ACE, TIER_OK, TIER_BAD, TIER_FAIL = 0, 1, 2, 3
+	local TIER_DEBOUNCE_FRAMES = 8
+	local MARKER_GRID = 8            -- snap recorded drops to 8px grid
+	local MARKER_MIN_SEQ_GAP = 30    -- suppress duplicate drops within N seq
+	local MARKER_SHOW_FRAMES = 240   -- show markers for first ~4s of each board
+	local TIER_CUE_RATE_FRAMES = 60  -- rate limit tier-change cues
+	local FRIGHT_WINDOW_FRAMES = 480 -- ghost fright period cap for fanfare check
+
 	local mac, cpu, mem, scr
-	local plugin_path
+	local plugin_path, data_path
 	local patx, paty, pacx, pacy, oldpacx, oldpacy, lagx, lagy
 	local mode, level, patid, patgroup, state, pills, oldstate, folder, first
 	local seq, switch = 0, 0
 	local pattern, group, info = {}, {}, {}
 	local loaded, valid, failed, adjusted, lagging, ignore, freestyle, perfect = false, false, false, false, false, false, false, false
 	local lag_pixels = LAG_PIXELS_DEFAULT
-	
+
+	-- Tier tracking (features 1, 2, 3)
+	local tier_raw, tier_stable, tier_hold = TIER_ACE, TIER_ACE, 0
+	local tier_cue_last_frame = -TIER_CUE_RATE_FRAMES
+
+	-- Breakpoint map state
+	local markers = {}                  -- keyed by "folder|patgroup", value = {[key]={y,x,seq,count}}
+	local markers_loaded = {}           -- which "folder|patgroup" keys we've loaded from disk
+	local markers_dirty = {}            -- which keys need flushing
+	local last_record_seq = -MARKER_MIN_SEQ_GAP
+	local board_start_frame = 0
+
+	-- Four-ghost fanfare state
+	local prev_score = 0
+	local ghost_run_count = 0           -- ghosts eaten this fright period
+	local fright_start_frame = -1
+	local fanfare_fired = false
+	local prev_pills = 0
+
+	-- MAME output support (may not exist on older MAME)
+	local output_api = nil              -- "new" | "old" | nil
+	local output_ok = false
+
 	info["pacstrats"] = "Uses only 3 patterns to clear boards 1 through 255."
 	info["killerclown"] = "Uses 5 similar patterns that should be easier to learn."
 	info["perfect_nrc"] = "An advanced pattern set for attaining a perfect score."
-	
+
 	function get_next(table, id)
 		local found = false
 		nextid = "pacstrats" -- default
@@ -88,10 +119,91 @@ function pactrainer.startplugin()
 				break
 			end
 			if v == id then found = true end
-		end		
+		end
 		return nextid
 	end
-	
+
+	-- Return a writable data path under MAME's homepath, falling back to plugin_path.
+	-- The existing active.dat write in the plugin directory breaks on read-only installs.
+	local function resolve_data_path()
+		local candidates = {}
+		local ok, val = pcall(function() return manager.machine.options.entries["homepath"]:value() end)
+		if ok and val then table.insert(candidates, val) end
+		ok, val = pcall(function() return manager:options().entries["homepath"]:value() end)
+		if ok and val then table.insert(candidates, val) end
+		for _, entry in ipairs(candidates) do
+			-- homepath may be ";"- or ":"-separated. Take first non-empty segment.
+			for seg in string.gmatch(entry, "[^;:]+") do
+				if seg and #seg > 0 then
+					local dir = seg.."/pactrainer"
+					local probe = io.open(dir.."/.probe", "w")
+					if probe then
+						probe:close()
+						os.remove(dir.."/.probe")
+						return dir
+					end
+					-- Try to create it
+					os.execute('mkdir -p "'..dir..'" 2>/dev/null || mkdir "'..seg..'\\pactrainer" 2>NUL')
+					probe = io.open(dir.."/.probe", "w")
+					if probe then
+						probe:close()
+						os.remove(dir.."/.probe")
+						return dir
+					end
+				end
+			end
+		end
+		return plugin_path
+	end
+
+	local function detect_output_api()
+		if output_api ~= nil then return end
+		-- Newer MAME (~0.227+): mac.output:set_value(name, value)
+		local ok, out = pcall(function() return mac.output end)
+		if ok and out and out.set_value then
+			output_api = "new"
+			output_ok = true
+			return
+		end
+		-- Older MAME: mac:outputs():set_value(name, value)
+		ok, out = pcall(function() return mac:outputs() end)
+		if ok and out and out.set_value then
+			output_api = "old"
+			output_ok = true
+			return
+		end
+		output_api = "none"
+		output_ok = false
+	end
+
+	local function set_output(name, value)
+		if not output_ok then return end
+		if output_api == "new" then
+			pcall(function() mac.output:set_value(name, value) end)
+		elseif output_api == "old" then
+			pcall(function() mac:outputs():set_value(name, value) end)
+		end
+	end
+
+	-- Fire a WAV file through the OS's native player, non-blocking. MAME's Lua API
+	-- has no play-sound primitive, so this is a shell-out. Files live in
+	-- <plugin_path>/sounds/<name>.wav; missing files silently no-op.
+	local is_windows = package.config:sub(1, 1) == "\\" or os.getenv("OS") == "Windows_NT"
+	local function play_sound(name)
+		if not plugin_path or not name then return end
+		local path = plugin_path.."/sounds/"..name..".wav"
+		local probe = io.open(path, "r")
+		if not probe then return end
+		probe:close()
+		if is_windows then
+			-- PowerShell SoundPlayer runs off-thread when started via `start /min`.
+			os.execute('start /min "" powershell -NoProfile -Command "(New-Object Media.SoundPlayer \''..path..'\').Play()" >NUL 2>&1')
+		else
+			-- Try common Unix players in order; the first that exists wins. `&` backgrounds.
+			os.execute('(command -v afplay >/dev/null && afplay "'..path..'" || command -v paplay >/dev/null && paplay "'..path..'" || command -v aplay >/dev/null && aplay -q "'..path..'") >/dev/null 2>&1 &')
+		end
+	end
+
 	function pactrainer_initialize()
 		if type(manager.machine) == "userdata" then
 			mac = manager.machine
@@ -99,7 +211,7 @@ function pactrainer.startplugin()
 		else
 			mac = manager:machine()
 			plugin_path = manager:options().entries["pluginspath"]:value().."/pactrainer"
-		end	
+		end
 		if mac then
 			if emu.romname() == "pacman" or emu.romname() == "puckman" then
 				cpu = mac.devices[":maincpu"]
@@ -108,31 +220,54 @@ function pactrainer.startplugin()
 				if not plugin_path then
 					plugin_path = "plugins/pactrainer"
 				end
+				data_path = resolve_data_path()
+				detect_output_api()
 			--Suppress the error print as we may enable the plugin universally
 			--else
 			--	print("The Pac-Man trainer works only with 'pacman' and 'puckman' roms.")
 			end
 		end
 	end
-	
+
+	-- Try reading active.dat from data_path first (writable), then fall back to plugin_path.
+	local function read_active_folder()
+		for _, base in ipairs({data_path, plugin_path}) do
+			if base then
+				local file = io.open(base.."/patterns/active.dat", "r")
+				if not file then file = io.open(base.."/active.dat", "r") end
+				if file then
+					local val = file:read("*all")
+					file:close()
+					if val and #val > 2 then return val end
+				end
+			end
+		end
+		return nil
+	end
+
+	local function write_active_folder(name)
+		if data_path then
+			local file = io.open(data_path.."/active.dat", "w")
+			if file then file:write(name); file:close(); return true end
+		end
+		local file = io.open(plugin_path.."/patterns/active.dat", "w")
+		if file then file:write(name); file:close(); return true end
+		return false
+	end
+
 	function pactrainer_patterns()
 		local content, file, prev_line
-				
-		-- look for the active pattern folder
+
 		if not folder then
-			file = io.open(plugin_path.."/patterns/active.dat", "r")
-			if file then
-				folder = file:read("*all")
-				file:close()
-			end
+			folder = read_active_folder()
 		end
 		if not folder or #folder <= 2 then
 			folder = get_next(SETS)
 		end
-														
+
 		-- Each level can have a pattern but we want as few patterns as possible to help with learning
 		-- If a pattern is not found then the previous level patterns is used.  This allows patterns to be grouped.
-		-- Typically there will only be a few patterns like 1,2,3,4 are similar,  5-20 are all the same,  21+ are all the same		
+		-- Typically there will only be a few patterns like 1,2,3,4 are similar,  5-20 are all the same,  21+ are all the same
 		pattern = {}
 		group = {}
 		for l=1, 256 do
@@ -144,33 +279,33 @@ function pactrainer.startplugin()
 					group[l] = {l, g}
 
 					local _i = 0
-					for line in file:lines() do 
+					for line in file:lines() do
 						if line ~= prev_line then
 							pattern[_i + (l * 100000)] = line
 							_i = _i + 1
 							prev_line = line
 						end
-					end				
+					end
 					file:close()
 					break
 				end
 			end
-			if group[l] == nil then 
+			if group[l] == nil then
 				group[l] = group[l - 1]  -- use previous pattern for this level
 			end
 		end
 		perfect = string.find(folder, "perfect") ~= nil
 		lag_pixels = LAG_PIXELS_DEFAULT + (perfect and 1 or 0)
-		loaded = true				
+		loaded = true
 	end
-	
+
 	function pattern_toggle()
 		-- Check for pattern change when P2 key press is detected
 		if mode == 1 then
 			if info[folder] then
-				mac:popmessage(string.upper(folder).." patterns:\n"..info[folder].."\n(Push P2 to toggle)")		
+				mac:popmessage(string.upper(folder).." patterns:\n"..info[folder].."\n(Push P2 to toggle)")
 			else
-				mac:popmessage(string.upper(folder).." patterns\n(Push P2 to toggle)")		
+				mac:popmessage(string.upper(folder).." patterns\n(Push P2 to toggle)")
 			end
 		end
 		if scr:frame_number() > switch + 30 and string.sub(integer_to_binary(mem:read_u8(0x5040)), 2, 2) == "0" then
@@ -180,19 +315,29 @@ function pactrainer.startplugin()
 				mac:popmessage(string.upper(folder).." patterns will be active at next level start.")
 			end
 			switch = scr:frame_number()
-			
-			-- save as default
-			file = io.open(plugin_path.."/patterns/active.dat", "w")
-			if file then
-				file:write(folder)
-				file:close()
-			end
+			write_active_folder(folder)
 		end
 	end
-	
+
 	function reset()
 		seq = 0
 		failed, lagging, ignore, freestyle = false, false, false, false
+		paty, patx = nil, nil
+		lagx, lagy = nil, nil
+		tier_raw, tier_stable, tier_hold = TIER_ACE, TIER_ACE, 0
+		last_record_seq = -MARKER_MIN_SEQ_GAP
+		if scr then board_start_frame = scr:frame_number() end
+		ghost_run_count = 0
+		fright_start_frame = -1
+		fanfare_fired = false
+		-- Seed prev_score so the first read this board doesn't produce a huge delta.
+		if mem then
+			local b0 = mem:read_u8(0x4e80)
+			local b1 = mem:read_u8(0x4e81)
+			local b2 = mem:read_u8(0x4e82)
+			local function bcd(b) return math.floor(b / 16) * 10 + (b % 16) end
+			prev_score = bcd(b0) + bcd(b1) * 100 + bcd(b2) * 10000
+		end
 	end
 
 	function write_bytes(address, b1, b2, b3, b4, b5)
@@ -206,7 +351,7 @@ function pactrainer.startplugin()
 			end
 		end
 	end
-	
+
 	function integer_to_binary(x)
 		local ret = ""
 		while x~=1 and x~=0 do
@@ -215,7 +360,171 @@ function pactrainer.startplugin()
 		end
 		return string.format("%08d", tostring(x)..ret)
     end
-	
+
+	-- Read Pac-Man Player 1 score. Stored at 0x4E80-0x4E82 as BCD, low byte first.
+	-- Each byte packs two decimal digits, so max representable is 999999 (game caps at 3333360).
+	local function read_score()
+		if not mem then return 0 end
+		local b0 = mem:read_u8(0x4e80)  -- ones, tens
+		local b1 = mem:read_u8(0x4e81)  -- hundreds, thousands
+		local b2 = mem:read_u8(0x4e82)  -- ten-thousands, hundred-thousands
+		local function bcd(b) return math.floor(b / 16) * 10 + (b % 16) end
+		return bcd(b0) + bcd(b1) * 100 + bcd(b2) * 10000
+	end
+
+	local function compute_raw_tier()
+		if failed then return TIER_FAIL end
+		if lagging then return TIER_BAD end
+		if lagx and lagy then
+			local mx = math.max(lagx, lagy)
+			if mx <= 1 then return TIER_ACE end
+			return TIER_OK
+		end
+		return TIER_ACE
+	end
+
+	local function update_tier()
+		local raw = compute_raw_tier()
+		if raw ~= tier_raw then
+			tier_raw = raw
+			tier_hold = 1
+		else
+			tier_hold = tier_hold + 1
+		end
+		if tier_hold >= TIER_DEBOUNCE_FRAMES and tier_raw ~= tier_stable then
+			local prev = tier_stable
+			tier_stable = tier_raw
+			return prev, tier_stable
+		end
+		return tier_stable, tier_stable
+	end
+
+	local function marker_key()
+		if not folder or not patgroup then return nil end
+		return folder.."|"..tostring(patgroup)
+	end
+
+	local function marker_file(mkey)
+		if not data_path or not mkey then return nil end
+		local f, g = string.match(mkey, "([^|]+)|(.+)")
+		return data_path.."/misses_"..f.."_"..string.format("%02d", tonumber(g) or 0)..".dat"
+	end
+
+	local function load_markers(mkey)
+		if not mkey or markers_loaded[mkey] then return end
+		markers_loaded[mkey] = true
+		markers[mkey] = markers[mkey] or {}
+		local path = marker_file(mkey)
+		if not path then return end
+		local file = io.open(path, "r")
+		if not file then return end
+		for line in file:lines() do
+			local s, y, x, c = string.match(line, "^(%-?%d+),(%-?%d+),(%-?%d+),(%d+)")
+			if s and y and x and c then
+				local key = y..","..x
+				markers[mkey][key] = {seq=tonumber(s), y=tonumber(y), x=tonumber(x), count=tonumber(c)}
+			end
+		end
+		file:close()
+	end
+
+	local function flush_markers(mkey)
+		if not mkey or not markers_dirty[mkey] then return end
+		local path = marker_file(mkey)
+		if not path then return end
+		local file = io.open(path, "w")
+		if not file then return end
+		for _, m in pairs(markers[mkey] or {}) do
+			file:write(string.format("%d,%d,%d,%d\n", m.seq, m.y, m.x, m.count))
+		end
+		file:close()
+		markers_dirty[mkey] = nil
+	end
+
+	local function record_breakpoint()
+		if not pacx or not pacy or not seq then return end
+		if seq - last_record_seq < MARKER_MIN_SEQ_GAP then return end
+		local mkey = marker_key()
+		if not mkey then return end
+		load_markers(mkey)
+		local sy = math.floor(pacy / MARKER_GRID) * MARKER_GRID
+		local sx = math.floor(pacx / MARKER_GRID) * MARKER_GRID
+		local key = sy..","..sx
+		local m = markers[mkey][key]
+		if m then
+			m.count = m.count + 1
+			m.seq = seq
+		else
+			markers[mkey][key] = {seq=seq, y=sy, x=sx, count=1}
+		end
+		markers_dirty[mkey] = true
+		last_record_seq = seq
+	end
+
+	local function draw_markers()
+		local mkey = marker_key()
+		if not mkey or not markers[mkey] then return end
+		if scr:frame_number() - board_start_frame > MARKER_SHOW_FRAMES then return end
+		for _, m in pairs(markers[mkey]) do
+			local alpha = math.min(255, 60 + m.count * 40)
+			local color = (alpha * 0x1000000) + 0xff8000  -- amber, alpha scales with count
+			scr:draw_box(m.y + 13, m.x - 13, m.y + 18, m.x - 18, color, color)
+		end
+	end
+
+	-- Detect eating all four ghosts on one energizer.
+	-- Uses score delta (200/400/800/1600 progression); resets when a new energizer is eaten.
+	-- Pills-eaten (0x4E0E) increments by 1 for a dot and by 1 for an energizer, so we watch
+	-- the score jump instead of trying to distinguish. When ghost_run_count hits 4, fire once.
+	local function update_fanfare()
+		if not mem or mode ~= 3 then return end
+		local score = read_score()
+		local delta = score - prev_score
+		prev_score = score
+
+		-- New fright period detection: sub-state briefly enters ghost-eat freeze range,
+		-- but the cleanest signal is a +50 score jump (energizer) which starts a fright.
+		if delta == 50 then
+			ghost_run_count = 0
+			fright_start_frame = scr:frame_number()
+			fanfare_fired = false
+			return
+		end
+		-- Fright period timeout - reset the count so a later ghost eat during a new
+		-- energizer doesn't accidentally chain.
+		if fright_start_frame >= 0 and scr:frame_number() - fright_start_frame > FRIGHT_WINDOW_FRAMES then
+			ghost_run_count = 0
+			fright_start_frame = -1
+		end
+
+		if delta == 200 or delta == 400 or delta == 800 or delta == 1600 then
+			ghost_run_count = ghost_run_count + 1
+			if delta == 1600 and not fanfare_fired then
+				fanfare_fired = true
+				play_sound("fanfare")
+				mac:popmessage("*** ALL FOUR GHOSTS! ***")
+			end
+		end
+	end
+
+	local function tier_name(t)
+		if t == TIER_ACE then return "ACE" end
+		if t == TIER_OK then return "OK" end
+		if t == TIER_BAD then return "BAD" end
+		return "FAIL"
+	end
+
+	local function on_tier_change(prev, curr)
+		-- Fire on tier increase only (getting worse), rate limited.
+		if curr <= prev then return end
+		local now = scr:frame_number()
+		if now - tier_cue_last_frame < TIER_CUE_RATE_FRAMES then return end
+		tier_cue_last_frame = now
+		-- Play tier_ok / tier_bad / tier_fail wav if present, plus a popmessage backup.
+		play_sound("tier_"..string.lower(tier_name(curr)))
+		mac:popmessage("Tier: "..tier_name(curr))
+	end
+
 	function display_status()
 		if loaded then
 			local _sub = string.sub
@@ -226,7 +535,7 @@ function pactrainer.startplugin()
 			--level info
 			write_bytes(0x43ac, 0x4c, 0x25, tonumber(_sub(_lev, 1, 1)) + 0x30, tonumber(_sub(_lev, 2, 2)) + 0x30, tonumber(_sub(_lev, 3, 3)) + 0x30)
 			--pattern info
-			write_bytes(0x43b2, 0x50, 0x25, tonumber(_sub(_grp, 1, 1)) + 0x30, tonumber(_sub(_grp, 2, 2)) + 0x30, 0x40)	
+			write_bytes(0x43b2, 0x50, 0x25, tonumber(_sub(_grp, 1, 1)) + 0x30, tonumber(_sub(_grp, 2, 2)) + 0x30, 0x40)
 			--status info
 			if mem:read_u8(0x40cc) ~= 0x53 then
 				write_bytes(0x40cc, 0x53, 0x25, 0x41, 0x43, 0x45)
@@ -256,12 +565,12 @@ function pactrainer.startplugin()
 				else
 					write_bytes(0x40b2, 0x40, 0x40, 0x40, 0x40)
 				end
-			end			
+			end
 		end
 	end
-	
+
 	function pactrainer_main()
-		if mem and not mac.paused then									
+		if mem and not mac.paused then
 			if not loaded then
 				if  scr:frame_number() > 300 then
 					-- Load patterns after pacman has fully booted
@@ -271,19 +580,19 @@ function pactrainer.startplugin()
 						mac:exit()
 					end
 				end
-			else				
+			else
 				mode = mem:read_u8(0x4e00)
 				state = mem:read_u8(0x4e04)
 				pacx = mem:read_u8(0x4d09)
 				pacy = mem:read_u8(0x4d08)
 				level = mem:read_u8(0x4e13) + 1
-				pills = mem:read_u8(0x4e0e)						
+				pills = mem:read_u8(0x4e0e)
 
-				pattern_toggle()	
-									
+				pattern_toggle()
+
 				if mode == 3 then
 					patid, patgroup = group[level][1], group[level][2]
-					
+
 					if (state == 3 and oldstate ~= 3) or state == 36 then
 						reset()
 					end
@@ -298,23 +607,24 @@ function pactrainer.startplugin()
 					if not failed then
 						first = true
 						adjusted = false
-						
+						local found_pat = false
+
 						data = pattern[(patid * 100000) + seq]
-						
+
 						--Debugging---------
 						--print(data)
 						--ignore = true
 						--print(pacy, pacx)
 						--------------------
-						
+
 						-- Perfect pattern folders should include the term perfect
 						-- We won't adjust the path as all ghosts are intended to be eaten
 						if perfect then
 							ignore = true
-						end						
-						
+						end
+
 						if not (state > 12 and state < 36) then
-						
+
 							if data == "------" then
 								-- Ignore lagging behind when turning back on self
 								ignore = true
@@ -324,7 +634,7 @@ function pactrainer.startplugin()
 								ignore = false
 								data = nil
 							elseif data == "######" then
-								-- For partial patterns, turn the path yellow to indicate freestyle to complete the board													
+								-- For partial patterns, turn the path yellow to indicate freestyle to complete the board
 								freestyle = true
 								data = nil
 							elseif data and #data > 6 and string.sub(data, 1, 6) == "REMARK" then
@@ -332,26 +642,28 @@ function pactrainer.startplugin()
 								mac:popmessage(string.sub(data, 8, #data))
 								data = nil
 							end
-							
+
 							for _f = seq + 80, seq, -1 do
-								local data = pattern[(patid * 100000) + _f]																					
+								local data = pattern[(patid * 100000) + _f]
 								if data then
-									paty, patx = tonumber(string.sub(data, 1, 3)), tonumber(string.sub(data, 4, 6))
-									if paty and patx then
+									local py, px = tonumber(string.sub(data, 1, 3)), tonumber(string.sub(data, 4, 6))
+									if py and px then
+										paty, patx = py, px
+										found_pat = true
 										if (seq - _f) % 5 == 0 then
 											-- draw every 5th line segment
-											
+
 											local _color = GREEN
-											if freestyle then 
-												_color = YELLOW 
-											elseif lagging then 
-												_color = RED 
-											end										
+											if freestyle then
+												_color = YELLOW
+											elseif lagging then
+												_color = RED
+											end
 											scr:draw_box(paty+15, patx-15, paty+16, patx-16, _color, _color)
 											if first then
 												scr:draw_box(paty+14, patx-14, paty+17, patx-17, _color, _color)
 												first = false
-											end						
+											end
 										end
 										if not ignore and state == 3 and patx == pacx and paty == pacy and _f - seq > 0 then
 											-- Pacman has speeded ahead of pattern (by eating a ghost).  Make an adjustment.
@@ -361,13 +673,21 @@ function pactrainer.startplugin()
 									end
 								end
 							end
-						
+
+							-- Clear stale pattern coords when the lookup window ran off the end
+							-- of the pattern. Otherwise paty/patx keep the final coords forever
+							-- and the lag check flags a spurious BAD once the player walks away.
+							if not found_pat then
+								paty, patx = nil, nil
+								lagx, lagy = nil, nil
+							end
+
 							if state == 3 and (pacx ~= oldpacx or pacy ~= oldpacy) then
 								seq = seq + 1
 							end
-						
+
 							if state == 3 and paty and patx then
-								if state == 3 and (not adjusted and not ignore) or perfect then									
+								if state == 3 and (not adjusted and not ignore) or perfect then
 									-- Are we behind the pattern?
 									lagx = math.abs(patx - pacx)
 									lagy = math.abs(paty - pacy)
@@ -376,13 +696,38 @@ function pactrainer.startplugin()
 									end
 								end
 							end
-						
+
 							oldpacx, oldpacy = pacx, pacy
 						end
 					end
-		
+
+					-- Debounced tier drives features 1 (map), 2 (face), 3 (cue).
+					-- Skip advancing tier during the ghost-eat freeze so we don't
+					-- record a false drop from held lag values.
+					if not (state > 12 and state < 36) then
+						local prev_tier, curr_tier = update_tier()
+						if prev_tier ~= curr_tier then
+							if prev_tier == TIER_ACE and curr_tier >= TIER_OK and curr_tier ~= TIER_FAIL then
+								-- Record where the player dropped from ACE
+								record_breakpoint()
+							end
+							on_tier_change(prev_tier, curr_tier)
+						end
+					end
+					set_output("pactrainer_face", tier_stable)
+
+					-- Ensure markers for current group are loaded, then draw
+					local mkey = marker_key()
+					if mkey then load_markers(mkey) end
+					draw_markers()
+
+					-- Four-ghost fanfare detection
+					update_fanfare()
+
 					display_status()
 				else
+					-- Left play mode; flush any pending marker writes for the last group
+					for k in pairs(markers_dirty) do flush_markers(k) end
 					reset()
 				end
 				oldstate = state
@@ -390,15 +735,20 @@ function pactrainer.startplugin()
 		end
 	end
 
-	if emu.app_version() >= "0.256" then	
+	if emu.app_version() >= "0.256" then
 		pactrainer_postload = emu.add_machine_post_load_notifier(reset)
 		pactrainer_initialize = emu.add_machine_reset_notifier(pactrainer_initialize)
 	else
 		emu.register_start(function() reset() end)
-		emu.register_prestart(function() pactrainer_initialize() end)		
+		emu.register_prestart(function() pactrainer_initialize() end)
 	end
-		
+
 	emu.register_frame_done(function() pactrainer_main() end)
-	
+
+	-- Flush any pending marker writes on exit
+	emu.register_stop(function()
+		for k in pairs(markers_dirty) do flush_markers(k) end
+	end)
+
 end
 return exports

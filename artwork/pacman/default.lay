@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+<!--
+	Pattern Trainer face-state overlay.
+
+	Displays a coloured face indicator driven by the plugin's "pactrainer_face" output.
+	  state 0 = ACE (green)
+	  state 1 = OK  (yellow)
+	  state 2 = BAD (red)
+	  state 3 = FAIL (grey)
+
+	Uses disk primitives so the layout works with no external image assets. Drop in
+	ace.png / ok.png / bad.png / fail.png alongside this file and replace the <disk>
+	items with <image state="N" file="ace.png"/> etc. to use custom artwork.
+
+	Install: copy this folder to your MAME artworkpath as "pacman/" (or zip it as
+	pacman.zip). The plugin sets the face output every frame — if the artwork is
+	not installed, the plugin still runs normally.
+-->
+<mamelayout version="2">
+
+	<element name="face_ace">
+		<disk><color red="0.15" green="0.85" blue="0.15"/></disk>
+	</element>
+	<element name="face_ok">
+		<disk><color red="0.95" green="0.85" blue="0.10"/></disk>
+	</element>
+	<element name="face_bad">
+		<disk><color red="0.90" green="0.15" blue="0.15"/></disk>
+	</element>
+	<element name="face_fail">
+		<disk><color red="0.40" green="0.40" blue="0.40"/></disk>
+	</element>
+
+	<element name="face" defstate="0">
+		<disk state="0"><color red="0.15" green="0.85" blue="0.15"/></disk>
+		<disk state="1"><color red="0.95" green="0.85" blue="0.10"/></disk>
+		<disk state="2"><color red="0.90" green="0.15" blue="0.15"/></disk>
+		<disk state="3"><color red="0.40" green="0.40" blue="0.40"/></disk>
+	</element>
+
+	<element name="label_ace"><text string="ACE"><color red="1" green="1" blue="1"/></text></element>
+	<element name="label_ok"><text string="OK"><color red="1" green="1" blue="1"/></text></element>
+	<element name="label_bad"><text string="BAD"><color red="1" green="1" blue="1"/></text></element>
+	<element name="label_fail"><text string="FAIL"><color red="1" green="1" blue="1"/></text></element>
+
+	<view name="Trainer">
+		<screen index="0">
+			<bounds x="72" y="0" width="224" height="288"/>
+		</screen>
+
+		<!-- Live face state driven from the plugin -->
+		<element ref="face" name="pactrainer_face">
+			<bounds x="8" y="16" width="56" height="56"/>
+		</element>
+
+		<!-- Static legend on the left bezel -->
+		<element ref="face_ace"><bounds x="12" y="96"  width="16" height="16"/></element>
+		<element ref="label_ace"><bounds x="32" y="98" width="30" height="12"/></element>
+		<element ref="face_ok"><bounds x="12" y="120" width="16" height="16"/></element>
+		<element ref="label_ok"><bounds x="32" y="122" width="30" height="12"/></element>
+		<element ref="face_bad"><bounds x="12" y="144" width="16" height="16"/></element>
+		<element ref="label_bad"><bounds x="32" y="146" width="30" height="12"/></element>
+		<element ref="face_fail"><bounds x="12" y="168" width="16" height="16"/></element>
+		<element ref="label_fail"><bounds x="32" y="170" width="30" height="12"/></element>
+	</view>
+
+</mamelayout>
