@@ -65,6 +65,11 @@ function pactrainer.startplugin()
 	local GREEN, YELLOW, RED = 0xff00ff00, 0xffffff00, 0xffff0000
 	local SETS = {"pacstrats", "killerclown", "perfect_nrc"}
 	local LAG_PIXELS_DEFAULT = 5
+	local FANFARE_LINES = {
+		"EPIC FOUR-BAGGER!",
+		"WOW NICE FOUR-BAGGER!",
+		"JUST LIKE BILLY WOULD DO IT!",
+	}
 
 	-- Tier constants: 0=ACE, 1=OK, 2=BAD, 3=FAIL
 	local TIER_ACE, TIER_OK, TIER_BAD, TIER_FAIL = 0, 1, 2, 3
@@ -502,7 +507,7 @@ function pactrainer.startplugin()
 			if delta == 1600 and not fanfare_fired then
 				fanfare_fired = true
 				play_sound("fanfare")
-				mac:popmessage("*** ALL FOUR GHOSTS! ***")
+				mac:popmessage(FANFARE_LINES[math.random(#FANFARE_LINES)])
 			end
 		end
 	end
