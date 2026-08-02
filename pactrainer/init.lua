@@ -745,9 +745,15 @@ function pactrainer.startplugin()
 
 	emu.register_frame_done(function() pactrainer_main() end)
 
-	-- Flush any pending marker writes on exit
-	emu.register_stop(function()
-		for k in pairs(markers_dirty) do flush_markers(k) end
+	-- Best-effort flush of pending marker writes on MAME exit. The register_stop
+	-- callback isn't part of every MAME version's Lua API, so we probe with pcall.
+	-- If it's not available, markers still flush every time the game leaves play
+	-- mode (see the mode==3 else branch in pactrainer_main) — only a hard quit
+	-- mid-board can lose the most recent unflushed drops.
+	pcall(function()
+		emu.register_stop(function()
+			for k in pairs(markers_dirty) do flush_markers(k) end
+		end)
 	end)
 
 end
