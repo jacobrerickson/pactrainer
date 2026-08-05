@@ -97,8 +97,13 @@ function pactrainer.startplugin()
 	-- time (which fires ~8 frames after the drop, past the debounce window).
 	local last_dir = nil
 
-	-- Global sound-cooldown so overlapping cues don't play on top of each other.
+	-- Sound queue. Cues collide often (tier change + fanfare, or two tier changes
+	-- in quick succession), so instead of dropping late arrivals we buffer them
+	-- and release them one at a time on a cooldown. Priority items (fanfare)
+	-- skip the queue and play immediately.
 	local last_sound_frame = -SOUND_COOLDOWN_FRAMES
+	local sound_queue = {}
+	local SOUND_QUEUE_MAX = 2  -- cap so backups don't stack forever
 
 	-- Breakpoint map state
 	local markers = {}                  -- keyed by "folder|patgroup", value = {[key]={y,x,seq,count}}
@@ -201,14 +206,8 @@ function pactrainer.startplugin()
 	-- has no play-sound primitive, so this is a shell-out. Files live in
 	-- <plugin_path>/sounds/<name>.wav; missing files silently no-op.
 	local is_windows = package.config:sub(1, 1) == "\\" or os.getenv("OS") == "Windows_NT"
-	local function play_sound(name, force)
+	local function play_sound_now(name)
 		if not plugin_path or not name then return end
-		-- Global cooldown so overlapping cues don't stack. `force=true` bypasses
-		-- (used by the four-ghost fanfare, which is rare enough to always play).
-		if not force and scr then
-			local now = scr:frame_number()
-			if now - last_sound_frame < SOUND_COOLDOWN_FRAMES then return end
-		end
 		local path = plugin_path.."/sounds/"..name..".wav"
 		local probe = io.open(path, "r")
 		if not probe then
@@ -234,6 +233,27 @@ function pactrainer.startplugin()
 			print("pactrainer: play_sound failed: "..tostring(err))
 			print("pactrainer: attempted command: "..cmd)
 		end
+	end
+
+	-- Public entry point. force=true means "priority" (fanfare): play immediately
+	-- without queueing. Regular calls buffer in the queue and get released by
+	-- process_sound_queue() one at a time on cooldown.
+	local function play_sound(name, force)
+		if force then
+			play_sound_now(name)
+			return
+		end
+		if #sound_queue >= SOUND_QUEUE_MAX then return end
+		-- Skip if the same sound is already queued or currently playing.
+		if sound_queue[#sound_queue] == name then return end
+		table.insert(sound_queue, name)
+	end
+
+	local function process_sound_queue()
+		if #sound_queue == 0 or not scr then return end
+		if scr:frame_number() - last_sound_frame < SOUND_COOLDOWN_FRAMES then return end
+		local name = table.remove(sound_queue, 1)
+		play_sound_now(name)
 	end
 
 	function pactrainer_initialize()
@@ -358,6 +378,7 @@ function pactrainer.startplugin()
 		lagx, lagy = nil, nil
 		tier_raw, tier_stable, tier_hold = TIER_ACE, TIER_ACE, 0
 		last_dir = nil
+		sound_queue = {}
 		last_record_seq = -MARKER_MIN_SEQ_GAP
 		if scr then board_start_frame = scr:frame_number() end
 		ghost_run_count = 0
@@ -499,6 +520,16 @@ function pactrainer.startplugin()
 		last_record_seq = seq
 	end
 
+	-- Arrow shape as a set of relative rectangles {dy1, dx1, dy2, dx2} per direction.
+	-- Each shape is a shaft rectangle plus a chevron head built from progressively
+	-- narrower rectangles that taper to a 1px tip in the movement direction.
+	local ARROW_SHAPES = {
+		r = { {-1,-6,1,2},   {-3,2,3,3},   {-2,3,2,4},   {-1,4,1,5},   {0,5,0,7}   },
+		l = { {-1,-2,1,6},   {-3,-3,3,-2}, {-2,-4,2,-3}, {-1,-5,1,-4}, {0,-7,0,-5} },
+		d = { {-6,-1,2,1},   {2,-3,3,3},   {3,-2,4,2},   {4,-1,5,1},   {5,0,7,0}   },
+		u = { {-2,-1,6,1},   {-3,-3,-2,3}, {-4,-2,-3,2}, {-5,-1,-4,1}, {-7,0,-5,0} },
+	}
+
 	local function draw_markers()
 		local mkey = marker_key()
 		if not mkey or not markers[mkey] then return end
@@ -508,19 +539,14 @@ function pactrainer.startplugin()
 			-- Use the same (paty+15, patx-15) offset the path uses so the marker
 			-- sits on the drawn path line, not off in gutter tiles.
 			local cy, cx = m.y + 15, m.x - 15
-			-- Base marker: 5x5 square centered on the drop point.
-			scr:draw_box(cy - 2, cx - 2, cy + 3, cx + 3, color, color)
-			-- Directional tail: 2px wide, 8px long, pointing in the direction the
-			-- player was moving when they dropped. Reads as "you were going that way".
-			local d = m.dir
-			if d == "r" then
-				scr:draw_box(cy - 1, cx + 3, cy + 2, cx + 11, color, color)
-			elseif d == "l" then
-				scr:draw_box(cy - 1, cx - 11, cy + 2, cx - 3, color, color)
-			elseif d == "d" then
-				scr:draw_box(cy + 3, cx - 1, cy + 11, cx + 2, color, color)
-			elseif d == "u" then
-				scr:draw_box(cy - 11, cx - 1, cy - 3, cx + 2, color, color)
+			local shape = ARROW_SHAPES[m.dir]
+			if shape then
+				for _, r in ipairs(shape) do
+					scr:draw_box(cy + r[1], cx + r[2], cy + r[3], cx + r[4], color, color)
+				end
+			else
+				-- No direction (legacy marker) → fall back to a plain 5x5 square.
+				scr:draw_box(cy - 2, cx - 2, cy + 3, cx + 3, color, color)
 			end
 		end
 	end
@@ -570,10 +596,12 @@ function pactrainer.startplugin()
 	local function on_tier_change(prev, curr)
 		-- Fire on tier increase only (getting worse), rate limited.
 		if curr <= prev then return end
+		-- Skip FAIL entirely — you know when you died; you don't need a cue for it.
+		if curr == TIER_FAIL then return end
 		local now = scr:frame_number()
 		if now - tier_cue_last_frame < TIER_CUE_RATE_FRAMES then return end
 		tier_cue_last_frame = now
-		-- Play tier_ok / tier_bad / tier_fail wav if present, plus a popmessage backup.
+		-- Play tier_ok / tier_bad wav if present, plus a popmessage backup.
 		play_sound("tier_"..string.lower(tier_name(curr)))
 		mac:popmessage("Tier: "..tier_name(curr))
 	end
@@ -790,6 +818,9 @@ function pactrainer.startplugin()
 
 					-- Four-ghost fanfare detection
 					update_fanfare()
+
+					-- Release one queued sound if the cooldown has expired.
+					process_sound_queue()
 
 					display_status()
 				else
