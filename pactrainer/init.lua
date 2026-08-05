@@ -76,7 +76,6 @@ function pactrainer.startplugin()
 	local TIER_DEBOUNCE_FRAMES = 8
 	local MARKER_GRID = 8            -- snap recorded drops to 8px grid
 	local MARKER_MIN_SEQ_GAP = 30    -- suppress duplicate drops within N seq
-	local MARKER_SHOW_FRAMES = 240   -- show markers for first ~4s of each board
 	local TIER_CUE_RATE_FRAMES = 60  -- rate limit tier-change cues
 	local FRIGHT_WINDOW_FRAMES = 480 -- ghost fright period cap for fanfare check
 
@@ -198,14 +197,27 @@ function pactrainer.startplugin()
 		if not plugin_path or not name then return end
 		local path = plugin_path.."/sounds/"..name..".wav"
 		local probe = io.open(path, "r")
-		if not probe then return end
+		if not probe then
+			print("pactrainer: no sound file at "..path)
+			return
+		end
 		probe:close()
+		local cmd
 		if is_windows then
-			-- PowerShell SoundPlayer runs off-thread when started via `start /min`.
-			os.execute('start /min "" powershell -NoProfile -Command "(New-Object Media.SoundPlayer \''..path..'\').Play()" >NUL 2>&1')
+			-- On Windows: PowerShell's SoundPlayer.PlaySync() blocks until the WAV
+			-- finishes. Wrapping in `start "" /min` detaches it so MAME isn't blocked.
+			-- Using .Play() (async) here does not work: PowerShell exits immediately
+			-- after Play() returns and the sound thread dies with the process.
+			local win_path = string.gsub(path, "/", "\\")
+			cmd = 'start "" /min powershell -NoProfile -WindowStyle Hidden -Command "(New-Object Media.SoundPlayer \''..win_path..'\').PlaySync()"'
 		else
 			-- Try common Unix players in order; the first that exists wins. `&` backgrounds.
-			os.execute('(command -v afplay >/dev/null && afplay "'..path..'" || command -v paplay >/dev/null && paplay "'..path..'" || command -v aplay >/dev/null && aplay -q "'..path..'") >/dev/null 2>&1 &')
+			cmd = '(command -v afplay >/dev/null && afplay "'..path..'" || command -v paplay >/dev/null && paplay "'..path..'" || command -v aplay >/dev/null && aplay -q "'..path..'") >/dev/null 2>&1 &'
+		end
+		local ok, err = pcall(function() os.execute(cmd) end)
+		if not ok then
+			print("pactrainer: play_sound failed: "..tostring(err))
+			print("pactrainer: attempted command: "..cmd)
 		end
 	end
 
@@ -424,10 +436,14 @@ function pactrainer.startplugin()
 		local file = io.open(path, "r")
 		if not file then return end
 		for line in file:lines() do
-			local s, y, x, c = string.match(line, "^(%-?%d+),(%-?%d+),(%-?%d+),(%d+)")
+			-- Format: seq,y,x,count[,dir]  (dir is optional for backward compat)
+			local s, y, x, c, d = string.match(line, "^(%-?%d+),(%-?%d+),(%-?%d+),(%d+),?([udlr]?)")
 			if s and y and x and c then
 				local key = y..","..x
-				markers[mkey][key] = {seq=tonumber(s), y=tonumber(y), x=tonumber(x), count=tonumber(c)}
+				markers[mkey][key] = {
+					seq=tonumber(s), y=tonumber(y), x=tonumber(x),
+					count=tonumber(c), dir=(d ~= "" and d or nil),
+				}
 			end
 		end
 		file:close()
@@ -440,10 +456,25 @@ function pactrainer.startplugin()
 		local file = io.open(path, "w")
 		if not file then return end
 		for _, m in pairs(markers[mkey] or {}) do
-			file:write(string.format("%d,%d,%d,%d\n", m.seq, m.y, m.x, m.count))
+			file:write(string.format("%d,%d,%d,%d,%s\n", m.seq, m.y, m.x, m.count, m.dir or ""))
 		end
 		file:close()
 		markers_dirty[mkey] = nil
+	end
+
+	-- Determine the direction Pac-Man was travelling when the drop was recorded.
+	-- Uses the current-frame delta against the previous frame.
+	local function current_direction()
+		if not oldpacx or not oldpacy or not pacx or not pacy then return nil end
+		local dx, dy = pacx - oldpacx, pacy - oldpacy
+		if math.abs(dx) > math.abs(dy) then
+			if dx > 0 then return "r" end
+			if dx < 0 then return "l" end
+		else
+			if dy > 0 then return "d" end
+			if dy < 0 then return "u" end
+		end
+		return nil
 	end
 
 	local function record_breakpoint()
@@ -455,12 +486,14 @@ function pactrainer.startplugin()
 		local sy = math.floor(pacy / MARKER_GRID) * MARKER_GRID
 		local sx = math.floor(pacx / MARKER_GRID) * MARKER_GRID
 		local key = sy..","..sx
+		local dir = current_direction()
 		local m = markers[mkey][key]
 		if m then
 			m.count = m.count + 1
 			m.seq = seq
+			m.dir = dir or m.dir  -- keep prior dir if we can't detect
 		else
-			markers[mkey][key] = {seq=seq, y=sy, x=sx, count=1}
+			markers[mkey][key] = {seq=seq, y=sy, x=sx, count=1, dir=dir}
 		end
 		markers_dirty[mkey] = true
 		last_record_seq = seq
@@ -469,11 +502,26 @@ function pactrainer.startplugin()
 	local function draw_markers()
 		local mkey = marker_key()
 		if not mkey or not markers[mkey] then return end
-		if scr:frame_number() - board_start_frame > MARKER_SHOW_FRAMES then return end
 		for _, m in pairs(markers[mkey]) do
-			local alpha = math.min(255, 60 + m.count * 40)
+			local alpha = math.min(255, 90 + m.count * 40)
 			local color = (alpha * 0x1000000) + 0xff8000  -- amber, alpha scales with count
-			scr:draw_box(m.y + 13, m.x - 13, m.y + 18, m.x - 18, color, color)
+			-- Use the same (paty+15, patx-15) offset the path uses so the marker
+			-- sits on the drawn path line, not off in gutter tiles.
+			local cy, cx = m.y + 15, m.x - 15
+			-- Base marker: 5x5 square centered on the drop point.
+			scr:draw_box(cy - 2, cx - 2, cy + 3, cx + 3, color, color)
+			-- Directional tail: 2px wide, 8px long, pointing in the direction the
+			-- player was moving when they dropped. Reads as "you were going that way".
+			local d = m.dir
+			if d == "r" then
+				scr:draw_box(cy - 1, cx + 3, cy + 2, cx + 11, color, color)
+			elseif d == "l" then
+				scr:draw_box(cy - 1, cx - 11, cy + 2, cx - 3, color, color)
+			elseif d == "d" then
+				scr:draw_box(cy + 3, cx - 1, cy + 11, cx + 2, color, color)
+			elseif d == "u" then
+				scr:draw_box(cy - 11, cx - 1, cy - 3, cx + 2, color, color)
+			end
 		end
 	end
 
