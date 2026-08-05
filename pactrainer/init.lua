@@ -73,11 +73,12 @@ function pactrainer.startplugin()
 
 	-- Tier constants: 0=ACE, 1=OK, 2=BAD, 3=FAIL
 	local TIER_ACE, TIER_OK, TIER_BAD, TIER_FAIL = 0, 1, 2, 3
-	local TIER_DEBOUNCE_FRAMES = 8
-	local MARKER_GRID = 8            -- snap recorded drops to 8px grid
-	local MARKER_MIN_SEQ_GAP = 30    -- suppress duplicate drops within N seq
-	local TIER_CUE_RATE_FRAMES = 60  -- rate limit tier-change cues
-	local FRIGHT_WINDOW_FRAMES = 480 -- ghost fright period cap for fanfare check
+	local TIER_DEBOUNCE_FRAMES = 16   -- ~0.27s hold; filters brief tier oscillations
+	local MARKER_GRID = 8             -- snap recorded drops to 8px grid
+	local MARKER_MIN_SEQ_GAP = 30     -- suppress duplicate drops within N seq
+	local TIER_CUE_RATE_FRAMES = 180  -- rate limit tier-change cues to 1 per 3s
+	local SOUND_COOLDOWN_FRAMES = 180 -- global gap between any two sounds (~3s)
+	local FRIGHT_WINDOW_FRAMES = 480  -- ghost fright period cap for fanfare check
 
 	local mac, cpu, mem, scr
 	local plugin_path, data_path
@@ -91,6 +92,13 @@ function pactrainer.startplugin()
 	-- Tier tracking (features 1, 2, 3)
 	local tier_raw, tier_stable, tier_hold = TIER_ACE, TIER_ACE, 0
 	local tier_cue_last_frame = -TIER_CUE_RATE_FRAMES
+
+	-- Direction tracked every frame Pac-Man moves. Used at record_breakpoint
+	-- time (which fires ~8 frames after the drop, past the debounce window).
+	local last_dir = nil
+
+	-- Global sound-cooldown so overlapping cues don't play on top of each other.
+	local last_sound_frame = -SOUND_COOLDOWN_FRAMES
 
 	-- Breakpoint map state
 	local markers = {}                  -- keyed by "folder|patgroup", value = {[key]={y,x,seq,count}}
@@ -193,8 +201,14 @@ function pactrainer.startplugin()
 	-- has no play-sound primitive, so this is a shell-out. Files live in
 	-- <plugin_path>/sounds/<name>.wav; missing files silently no-op.
 	local is_windows = package.config:sub(1, 1) == "\\" or os.getenv("OS") == "Windows_NT"
-	local function play_sound(name)
+	local function play_sound(name, force)
 		if not plugin_path or not name then return end
+		-- Global cooldown so overlapping cues don't stack. `force=true` bypasses
+		-- (used by the four-ghost fanfare, which is rare enough to always play).
+		if not force and scr then
+			local now = scr:frame_number()
+			if now - last_sound_frame < SOUND_COOLDOWN_FRAMES then return end
+		end
 		local path = plugin_path.."/sounds/"..name..".wav"
 		local probe = io.open(path, "r")
 		if not probe then
@@ -202,6 +216,7 @@ function pactrainer.startplugin()
 			return
 		end
 		probe:close()
+		if scr then last_sound_frame = scr:frame_number() end
 		local cmd
 		if is_windows then
 			-- On Windows: PowerShell's SoundPlayer.PlaySync() blocks until the WAV
@@ -342,6 +357,7 @@ function pactrainer.startplugin()
 		paty, patx = nil, nil
 		lagx, lagy = nil, nil
 		tier_raw, tier_stable, tier_hold = TIER_ACE, TIER_ACE, 0
+		last_dir = nil
 		last_record_seq = -MARKER_MIN_SEQ_GAP
 		if scr then board_start_frame = scr:frame_number() end
 		ghost_run_count = 0
@@ -462,21 +478,6 @@ function pactrainer.startplugin()
 		markers_dirty[mkey] = nil
 	end
 
-	-- Determine the direction Pac-Man was travelling when the drop was recorded.
-	-- Uses the current-frame delta against the previous frame.
-	local function current_direction()
-		if not oldpacx or not oldpacy or not pacx or not pacy then return nil end
-		local dx, dy = pacx - oldpacx, pacy - oldpacy
-		if math.abs(dx) > math.abs(dy) then
-			if dx > 0 then return "r" end
-			if dx < 0 then return "l" end
-		else
-			if dy > 0 then return "d" end
-			if dy < 0 then return "u" end
-		end
-		return nil
-	end
-
 	local function record_breakpoint()
 		if not pacx or not pacy or not seq then return end
 		if seq - last_record_seq < MARKER_MIN_SEQ_GAP then return end
@@ -486,14 +487,13 @@ function pactrainer.startplugin()
 		local sy = math.floor(pacy / MARKER_GRID) * MARKER_GRID
 		local sx = math.floor(pacx / MARKER_GRID) * MARKER_GRID
 		local key = sy..","..sx
-		local dir = current_direction()
 		local m = markers[mkey][key]
 		if m then
 			m.count = m.count + 1
 			m.seq = seq
-			m.dir = dir or m.dir  -- keep prior dir if we can't detect
+			m.dir = last_dir or m.dir  -- keep prior dir if we don't know current
 		else
-			markers[mkey][key] = {seq=seq, y=sy, x=sx, count=1, dir=dir}
+			markers[mkey][key] = {seq=seq, y=sy, x=sx, count=1, dir=last_dir}
 		end
 		markers_dirty[mkey] = true
 		last_record_seq = seq
@@ -554,7 +554,7 @@ function pactrainer.startplugin()
 			ghost_run_count = ghost_run_count + 1
 			if delta == 1600 and not fanfare_fired then
 				fanfare_fired = true
-				play_sound("fanfare")
+				play_sound("fanfare", true)  -- bypass cooldown; fanfare is rare
 				mac:popmessage(FANFARE_LINES[math.random(#FANFARE_LINES)])
 			end
 		end
@@ -747,6 +747,20 @@ function pactrainer.startplugin()
 									if (lagx >= lag_pixels and lagx < 100) or lagy >= lag_pixels then
 										lagging = true
 									end
+								end
+							end
+
+							-- Track direction while pac-man is moving. Sticky: keeps the
+							-- last known direction across frames where Pac-Man is momentarily
+							-- stopped (e.g. hitting a wall). Must run BEFORE oldpac* update.
+							if oldpacx and oldpacy then
+								local dx, dy = pacx - oldpacx, pacy - oldpacy
+								if math.abs(dx) > math.abs(dy) then
+									if dx > 0 then last_dir = "r"
+									elseif dx < 0 then last_dir = "l" end
+								elseif math.abs(dy) > 0 then
+									if dy > 0 then last_dir = "d"
+									else last_dir = "u" end
 								end
 							end
 
