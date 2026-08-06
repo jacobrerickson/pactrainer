@@ -69,6 +69,7 @@ function pactrainer.startplugin()
 		"EPIC FOUR-BAGGER!",
 		"WOW NICE FOUR-BAGGER!",
 		"JUST LIKE BILLY WOULD DO IT!",
+		"It's like I can feel his hand on the stick, guiding me...",
 	}
 
 	-- Tier constants: 0=ACE, 1=OK, 2=BAD, 3=FAIL
