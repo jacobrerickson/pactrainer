@@ -105,10 +105,11 @@ function pactrainer.startplugin()
 	local sound_queue = {}
 	local SOUND_QUEUE_MAX = 2  -- cap so backups don't stack forever
 
-	-- Breakpoint map state
-	local markers = {}                  -- keyed by "folder|patgroup", value = {[key]={y,x,seq,count}}
-	local markers_loaded = {}           -- which "folder|patgroup" keys we've loaded from disk
-	local markers_dirty = {}            -- which keys need flushing
+	-- Breakpoint map state. Session-only: markers live in memory during the
+	-- current level and are wiped when the level changes or a new game starts.
+	-- No files are read or written.
+	local markers = {}                  -- {[key]={y,x,seq,count,dir}}
+	local markers_level = nil           -- level number the current markers were recorded on
 	local last_record_seq = -MARKER_MIN_SEQ_GAP
 	local board_start_frame = 0
 
@@ -237,23 +238,27 @@ function pactrainer.startplugin()
 
 	-- Public entry point. force=true means "priority" (fanfare): play immediately
 	-- without queueing. Regular calls buffer in the queue and get released by
-	-- process_sound_queue() one at a time on cooldown.
-	local function play_sound(name, force)
+	-- process_sound_queue() one at a time on cooldown. `min_tier` marks a cue
+	-- as stale if the player has since recovered to a better tier at release
+	-- time — otherwise a tier_ok cue held over the cooldown would fire while
+	-- you're already back to ACE and sound like the recovery caused it.
+	local function play_sound(name, force, min_tier)
 		if force then
 			play_sound_now(name)
 			return
 		end
 		if #sound_queue >= SOUND_QUEUE_MAX then return end
-		-- Skip if the same sound is already queued or currently playing.
-		if sound_queue[#sound_queue] == name then return end
-		table.insert(sound_queue, name)
+		local last = sound_queue[#sound_queue]
+		if last and last.name == name then return end
+		table.insert(sound_queue, {name=name, min_tier=min_tier})
 	end
 
 	local function process_sound_queue()
 		if #sound_queue == 0 or not scr then return end
 		if scr:frame_number() - last_sound_frame < SOUND_COOLDOWN_FRAMES then return end
-		local name = table.remove(sound_queue, 1)
-		play_sound_now(name)
+		local item = table.remove(sound_queue, 1)
+		if item.min_tier and tier_stable < item.min_tier then return end
+		play_sound_now(item.name)
 	end
 
 	function pactrainer_initialize()
@@ -453,70 +458,31 @@ function pactrainer.startplugin()
 		return tier_stable, tier_stable
 	end
 
-	local function marker_key()
-		if not folder or not patgroup then return nil end
-		return folder.."|"..tostring(patgroup)
-	end
-
-	local function marker_file(mkey)
-		if not data_path or not mkey then return nil end
-		local f, g = string.match(mkey, "([^|]+)|(.+)")
-		return data_path.."/misses_"..f.."_"..string.format("%02d", tonumber(g) or 0)..".dat"
-	end
-
-	local function load_markers(mkey)
-		if not mkey or markers_loaded[mkey] then return end
-		markers_loaded[mkey] = true
-		markers[mkey] = markers[mkey] or {}
-		local path = marker_file(mkey)
-		if not path then return end
-		local file = io.open(path, "r")
-		if not file then return end
-		for line in file:lines() do
-			-- Format: seq,y,x,count[,dir]  (dir is optional for backward compat)
-			local s, y, x, c, d = string.match(line, "^(%-?%d+),(%-?%d+),(%-?%d+),(%d+),?([udlr]?)")
-			if s and y and x and c then
-				local key = y..","..x
-				markers[mkey][key] = {
-					seq=tonumber(s), y=tonumber(y), x=tonumber(x),
-					count=tonumber(c), dir=(d ~= "" and d or nil),
-				}
-			end
+	-- Wipe markers when the level number changes. Runs each frame; cheap when
+	-- level is stable. Covers all cases the user cares about: level advance,
+	-- new game (level resets to 1), and MAME restart (memory starts empty).
+	local function refresh_markers_for_level()
+		if markers_level ~= level then
+			markers = {}
+			markers_level = level
 		end
-		file:close()
-	end
-
-	local function flush_markers(mkey)
-		if not mkey or not markers_dirty[mkey] then return end
-		local path = marker_file(mkey)
-		if not path then return end
-		local file = io.open(path, "w")
-		if not file then return end
-		for _, m in pairs(markers[mkey] or {}) do
-			file:write(string.format("%d,%d,%d,%d,%s\n", m.seq, m.y, m.x, m.count, m.dir or ""))
-		end
-		file:close()
-		markers_dirty[mkey] = nil
 	end
 
 	local function record_breakpoint()
 		if not pacx or not pacy or not seq then return end
 		if seq - last_record_seq < MARKER_MIN_SEQ_GAP then return end
-		local mkey = marker_key()
-		if not mkey then return end
-		load_markers(mkey)
+		refresh_markers_for_level()
 		local sy = math.floor(pacy / MARKER_GRID) * MARKER_GRID
 		local sx = math.floor(pacx / MARKER_GRID) * MARKER_GRID
 		local key = sy..","..sx
-		local m = markers[mkey][key]
+		local m = markers[key]
 		if m then
 			m.count = m.count + 1
 			m.seq = seq
-			m.dir = last_dir or m.dir  -- keep prior dir if we don't know current
+			m.dir = last_dir or m.dir
 		else
-			markers[mkey][key] = {seq=seq, y=sy, x=sx, count=1, dir=last_dir}
+			markers[key] = {seq=seq, y=sy, x=sx, count=1, dir=last_dir}
 		end
-		markers_dirty[mkey] = true
 		last_record_seq = seq
 	end
 
@@ -531,9 +497,8 @@ function pactrainer.startplugin()
 	}
 
 	local function draw_markers()
-		local mkey = marker_key()
-		if not mkey or not markers[mkey] then return end
-		for _, m in pairs(markers[mkey]) do
+		if not markers or markers_level ~= level then return end
+		for _, m in pairs(markers) do
 			local alpha = math.min(255, 90 + m.count * 40)
 			local color = (alpha * 0x1000000) + 0xff8000  -- amber, alpha scales with count
 			-- Use the same (paty+15, patx-15) offset the path uses so the marker
@@ -545,7 +510,6 @@ function pactrainer.startplugin()
 					scr:draw_box(cy + r[1], cx + r[2], cy + r[3], cx + r[4], color, color)
 				end
 			else
-				-- No direction (legacy marker) → fall back to a plain 5x5 square.
 				scr:draw_box(cy - 2, cx - 2, cy + 3, cx + 3, color, color)
 			end
 		end
@@ -602,7 +566,9 @@ function pactrainer.startplugin()
 		if now - tier_cue_last_frame < TIER_CUE_RATE_FRAMES then return end
 		tier_cue_last_frame = now
 		-- Play tier_ok / tier_bad wav if present, plus a popmessage backup.
-		play_sound("tier_"..string.lower(tier_name(curr)))
+		-- Pass curr as min_tier so a delayed release gets cancelled if the
+		-- player has recovered by then.
+		play_sound("tier_"..string.lower(tier_name(curr)), false, curr)
 		mac:popmessage("Tier: "..tier_name(curr))
 	end
 
@@ -811,9 +777,8 @@ function pactrainer.startplugin()
 					end
 					set_output("pactrainer_face", tier_stable)
 
-					-- Ensure markers for current group are loaded, then draw
-					local mkey = marker_key()
-					if mkey then load_markers(mkey) end
+					-- Keep marker set fresh for the current level, then render.
+					refresh_markers_for_level()
 					draw_markers()
 
 					-- Four-ghost fanfare detection
@@ -824,8 +789,6 @@ function pactrainer.startplugin()
 
 					display_status()
 				else
-					-- Left play mode; flush any pending marker writes for the last group
-					for k in pairs(markers_dirty) do flush_markers(k) end
 					reset()
 				end
 				oldstate = state
@@ -842,17 +805,6 @@ function pactrainer.startplugin()
 	end
 
 	emu.register_frame_done(function() pactrainer_main() end)
-
-	-- Best-effort flush of pending marker writes on MAME exit. The register_stop
-	-- callback isn't part of every MAME version's Lua API, so we probe with pcall.
-	-- If it's not available, markers still flush every time the game leaves play
-	-- mode (see the mode==3 else branch in pactrainer_main) — only a hard quit
-	-- mid-board can lose the most recent unflushed drops.
-	pcall(function()
-		emu.register_stop(function()
-			for k in pairs(markers_dirty) do flush_markers(k) end
-		end)
-	end)
 
 end
 return exports

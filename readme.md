@@ -178,14 +178,18 @@ has no consumer.
 ## Breakpoint map
 
 Each time your run drops from ACE to OK on the pattern, the plugin records the
-board coordinate. The next time you play the same pattern, coloured markers
-appear at those spots during the first few seconds of the board so you can see
-your recurring problem corners. Corners you miss repeatedly grow more opaque.
+board coordinate as an amber arrow pointing in the direction you were
+travelling when you missed. Markers stay visible for the whole current level so
+you can see your recurring problem corners across multiple lives. Corners you
+miss repeatedly grow more opaque.
 
-Data is written to MAME's `homepath` as `pactrainer/misses_<set>_<group>.dat`
-(one row per point: `seq,y,x,count`). Nothing is written under the plugin
-directory, so read-only installs are supported. The `active.dat` file that
-remembers your selected pattern set is also written to `homepath`.
+Markers are session-only: they are wiped when the level number changes (level
+advance or new game) and never touch disk. Restart MAME and you start with a
+clean slate.
+
+The `active.dat` file that remembers your selected pattern set is still written
+to MAME's `homepath` so your pattern-set choice survives restarts. Nothing else
+is written under the plugin directory.
 
 
 ## Cues
