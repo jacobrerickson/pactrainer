@@ -560,12 +560,10 @@ function pactrainer.startplugin()
 	local function on_tier_change(prev, curr)
 		-- Fire on tier increase only (getting worse), rate limited.
 		if curr <= prev then return end
-		-- Skip FAIL entirely — you know when you died; you don't need a cue for it.
-		if curr == TIER_FAIL then return end
 		local now = scr:frame_number()
 		if now - tier_cue_last_frame < TIER_CUE_RATE_FRAMES then return end
 		tier_cue_last_frame = now
-		-- Play tier_ok / tier_bad wav if present, plus a popmessage backup.
+		-- Play tier_ok / tier_bad / tier_fail wav if present, plus a popmessage backup.
 		-- Pass curr as min_tier so a delayed release gets cancelled if the
 		-- player has recovered by then.
 		play_sound("tier_"..string.lower(tier_name(curr)), false, curr)
